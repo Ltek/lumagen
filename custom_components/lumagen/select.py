@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import cast
 
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .client import ASPECT_COMMANDS, InputMemory, LumagenState
-from .const import CONF_ASPECT_RATIOS, DOMAIN
-from .coordinator import LumagenCoordinator
-from .entity import LumagenEntity
+from .const import CONF_ASPECT_RATIOS
+from .coordinator import LumagenConfigEntry, LumagenCoordinator
+from .entity import LumagenEntity, call_client
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +81,36 @@ async def _select_memory(coord: LumagenCoordinator, option: str) -> None:
     await coord.client.select_memory(cast("InputMemory", option[-1]))  # "MEMA" → "A"
 
 
+def _label_options(coord: LumagenCoordinator, prefix: str, name: str) -> list[str]:
+    """Options like 'Rec709 (0)' built from cached CMS / style labels."""
+    labels = coord.client.state.labels_by_prefix(prefix)
+    return [f"{labels.get(f'{prefix}{i}') or f'{name} {i}'} ({i})" for i in range(8)]
+
+
+def _option_index(option: str) -> int:
+    """'Rec709 (3)' -> 3."""
+    match = re.search(r"\((\d)\)$", option)
+    if not match:
+        raise ValueError(f"Unrecognized option: {option!r}")
+    return int(match.group(1))
+
+
+def _current_label_option(
+    coord: LumagenCoordinator, prefix: str, name: str, index: int | None
+) -> str | None:
+    if index is None or not 0 <= index <= 7:
+        return None
+    return _label_options(coord, prefix, name)[index]
+
+
+async def _select_cms(coord: LumagenCoordinator, option: str) -> None:
+    await coord.client.set_cms(_option_index(option))
+
+
+async def _select_style(coord: LumagenCoordinator, option: str) -> None:
+    await coord.client.set_style(_option_index(option))
+
+
 # -- Entity descriptions ----------------------------------------------------
 
 SELECT_ENTITIES: tuple[LumagenSelectEntityDescription, ...] = (
@@ -108,16 +138,38 @@ SELECT_ENTITIES: tuple[LumagenSelectEntityDescription, ...] = (
         select_option_fn=_select_memory,
         static_options=["MEMA", "MEMB", "MEMC", "MEMD"],
     ),
+    LumagenSelectEntityDescription(
+        key="cms",
+        translation_key="cms",
+        icon="mdi:palette",
+        entity_registry_enabled_default=False,
+        current_option_fn=lambda data, coord: _current_label_option(
+            coord, "2", "CMS", data.output_cms
+        ),
+        select_option_fn=_select_cms,
+        options_fn=lambda coord: _label_options(coord, "2", "CMS"),
+    ),
+    LumagenSelectEntityDescription(
+        key="style",
+        translation_key="style",
+        icon="mdi:image-filter-hdr",
+        entity_registry_enabled_default=False,
+        current_option_fn=lambda data, coord: _current_label_option(
+            coord, "3", "Style", data.output_style
+        ),
+        select_option_fn=_select_style,
+        options_fn=lambda coord: _label_options(coord, "3", "Style"),
+    ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: LumagenConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Lumagen select entities."""
-    coordinator: LumagenCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     async_add_entities(
         LumagenSelectEntity(coordinator, desc) for desc in SELECT_ENTITIES
     )
@@ -170,7 +222,9 @@ class LumagenSelectEntity(LumagenEntity, SelectEntity):
         self._attr_current_option = option
         self.async_write_ha_state()
         try:
-            await self.entity_description.select_option_fn(self.coordinator, option)
+            await call_client(
+                self.entity_description.select_option_fn(self.coordinator, option)
+            )
         except Exception:
             self._optimistic_option = None
             self._update_attrs()

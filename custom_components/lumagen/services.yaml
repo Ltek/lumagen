@@ -70,6 +70,168 @@ show_osd_volume_bar:
       selector:
         text:
 
+show_osd_volume:
+  name: Show OSD volume
+  description: >-
+    Show a volume value (or mute) on the Lumagen OSD using the pattern builder.
+    Pattern fields you leave out come from the Volume display options
+    (Settings > Devices & Services > Lumagen > Configure), or the defaults.
+  fields:
+    entity_id:
+      name: Device
+      description: The Lumagen device to target.
+      required: true
+      selector:
+        entity:
+          filter:
+            - integration: lumagen
+              domain: remote
+    value:
+      name: Value
+      description: Volume value, in the same units as minimum / maximum. Required unless muted.
+      example: 42
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.01
+          mode: box
+    minimum:
+      name: Minimum
+      description: Value that draws an empty bar.
+      default: 0
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.01
+          mode: box
+    maximum:
+      name: Maximum
+      description: Value that draws a full bar.
+      default: 100
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.01
+          mode: box
+    muted:
+      name: Muted
+      description: Show the mute display instead of the value.
+      default: false
+      selector:
+        boolean:
+    lines:
+      name: Lines
+      description: 1 line, or 2 lines (label/value above, bar below).
+      selector:
+        select:
+          options: ["1", "2"]
+    bar_type:
+      name: Bar type
+      selector:
+        select:
+          options: [none, left_to_right, center_out]
+    value_placement:
+      name: Value placement
+      selector:
+        select:
+          options: [left, center, right]
+    bar_width:
+      name: Bar width
+      description: Number of bar cells; 0 fills the remaining space.
+      selector:
+        number:
+          min: 0
+          max: 30
+          mode: box
+    fill_char:
+      name: Fill character
+      description: '"solid" for a block bar, or any single character.'
+      example: solid
+      selector:
+        text:
+    empty_char:
+      name: Empty placeholder
+      description: Single character for the unused part of the bar; empty for blank.
+      example: "-"
+      selector:
+        text:
+    end_caps:
+      name: End caps
+      description: Two characters around the bar (e.g. "[]"); empty for none.
+      example: "[]"
+      selector:
+        text:
+    label:
+      name: Label
+      description: Text before the value; empty for none.
+      example: Volume
+      selector:
+        text:
+    value_suffix:
+      name: Text after value
+      example: " dB"
+      selector:
+        text:
+    value_display:
+      name: Value shown as
+      description: raw (as given), percent (of minimum..maximum), or linear (value x scale + offset).
+      selector:
+        select:
+          options: [raw, percent, linear]
+    value_scale:
+      name: Scale (linear)
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.001
+          mode: box
+    value_offset:
+      name: Offset (linear)
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.001
+          mode: box
+    decimals:
+      name: Decimal places
+      selector:
+        number:
+          min: 0
+          max: 2
+          mode: box
+    min_max_text:
+      name: Show Min / Max
+      selector:
+        boolean:
+    mute_display:
+      name: When muted, show
+      selector:
+        select:
+          options: [text, empty_bar, none]
+    mute_text:
+      name: Mute text
+      example: "- MUTE -"
+      selector:
+        text:
+    mute_persist:
+      name: Keep mute on screen
+      description: Keep the mute display until something replaces or clears it.
+      selector:
+        boolean:
+    duration:
+      name: Duration
+      description: Display time in seconds (1-8).
+      selector:
+        number:
+          min: 1
+          max: 8
+          mode: slider
+
 clear_osd_message:
   name: Clear OSD message
   description: Clear any OSD message from the Lumagen.
@@ -83,3 +245,67 @@ clear_osd_message:
           filter:
             - integration: lumagen
               domain: remote
+
+hotplug:
+  name: HDMI hotplug
+  description: >-
+    Toggle HDMI hotplug so sources re-read the EDID (fixes no picture / wrong
+    format / no audio without power-cycling the source).
+  fields:
+    entity_id:
+      name: Device
+      description: The Lumagen device to target.
+      required: true
+      selector:
+        entity:
+          filter:
+            - integration: lumagen
+              domain: remote
+    input:
+      name: HDMI input
+      description: Physical HDMI input (1-8). Leave empty for all inputs.
+      selector:
+        number:
+          min: 1
+          max: 8
+          mode: box
+
+set_osd_colors:
+  name: Set OSD colors
+  description: >-
+    Set the colors of RS232 OSD messages (Radiance Pro only). Applies to all
+    messages sent over RS232. To apply automatically after each power-on, use
+    the OSD colors option instead.
+  fields:
+    entity_id:
+      name: Device
+      description: The Lumagen device to target.
+      required: true
+      selector:
+        entity:
+          filter:
+            - integration: lumagen
+              domain: remote
+    foreground:
+      name: Text color
+      description: RRGGBB hex.
+      required: true
+      example: ffffff
+      selector:
+        text:
+    background:
+      name: Background color
+      description: RRGGBB hex.
+      required: true
+      example: "000000"
+      selector:
+        text:
+    blend:
+      name: Opacity
+      description: 1 (nearly transparent) to 15 (opaque).
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 15
+          mode: slider

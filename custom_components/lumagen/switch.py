@@ -11,14 +11,12 @@ from homeassistant.components.switch import (
     SwitchEntity,
     SwitchEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .client import LumagenState
-from .const import DOMAIN
-from .coordinator import LumagenCoordinator
-from .entity import LumagenEntity
+from .coordinator import LumagenConfigEntry, LumagenCoordinator
+from .entity import LumagenEntity, call_client
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -54,11 +52,11 @@ SWITCH_ENTITIES: tuple[LumagenSwitchEntityDescription, ...] = (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: LumagenConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Lumagen switches."""
-    coordinator: LumagenCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     async_add_entities(
         LumagenSwitchEntity(coordinator, desc) for desc in SWITCH_ENTITIES
     )
@@ -101,7 +99,7 @@ class LumagenSwitchEntity(LumagenEntity, SwitchEntity):
         self._attr_is_on = True
         self.async_write_ha_state()
         try:
-            await self.entity_description.turn_on_fn(self.coordinator)
+            await call_client(self.entity_description.turn_on_fn(self.coordinator))
         except Exception:
             self._optimistic_state = None
             self._update_attrs()
@@ -113,7 +111,7 @@ class LumagenSwitchEntity(LumagenEntity, SwitchEntity):
         self._attr_is_on = False
         self.async_write_ha_state()
         try:
-            await self.entity_description.turn_off_fn(self.coordinator)
+            await call_client(self.entity_description.turn_off_fn(self.coordinator))
         except Exception:
             self._optimistic_state = None
             self._update_attrs()

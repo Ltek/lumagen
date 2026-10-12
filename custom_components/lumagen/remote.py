@@ -7,27 +7,32 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from homeassistant.components.remote import RemoteEntity
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.remote import (
+    ATTR_DELAY_SECS,
+    ATTR_NUM_REPEATS,
+    RemoteEntity,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .client import REMOTE_COMMANDS
-from .const import DOMAIN
-from .coordinator import LumagenCoordinator
-from .entity import LumagenEntity
+from .coordinator import LumagenConfigEntry, LumagenCoordinator
+from .entity import LumagenEntity, call_client
 
 _LOGGER = logging.getLogger(__name__)
+
+# Gap between consecutive key presses when delay_secs is not given.
+DEFAULT_KEY_DELAY = 0.1
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: LumagenConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Lumagen remote."""
-    coordinator: LumagenCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([LumagenRemoteEntity(coordinator)])
+    async_add_entities([LumagenRemoteEntity(entry.runtime_data)])
 
 
 class LumagenRemoteEntity(LumagenEntity, RemoteEntity):
@@ -48,20 +53,32 @@ class LumagenRemoteEntity(LumagenEntity, RemoteEntity):
         self._attr_is_on = bool(data.power)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self.coordinator.client.power_on()
+        await call_client(self.coordinator.client.power_on())
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.coordinator.client.power_off()
+        await call_client(self.coordinator.client.power_off())
 
     async def async_send_command(self, command: Iterable[str], **kwargs: Any) -> None:
+        """Send key presses; honors num_repeats and delay_secs."""
         data = self.coordinator.data
         if not data or not data.power:
-            _LOGGER.warning("Cannot send commands while device is in standby")
-            return
+            raise HomeAssistantError("Lumagen is in standby; turn it on first")
 
-        for cmd in command:
-            if cmd.lower() in REMOTE_COMMANDS:
-                await self.coordinator.client.send_remote_command(cmd)
-                await asyncio.sleep(0.1)
-            else:
-                _LOGGER.warning("Unknown remote command: %s (ignored)", cmd)
+        commands = list(command)
+        unknown = [c for c in commands if c.lower() not in REMOTE_COMMANDS]
+        if unknown:
+            raise ServiceValidationError(
+                f"Unknown Lumagen remote command(s): {', '.join(unknown)}"
+            )
+
+        repeats = max(1, int(kwargs.get(ATTR_NUM_REPEATS) or 1))
+        delay = kwargs.get(ATTR_DELAY_SECS)
+        delay = DEFAULT_KEY_DELAY if delay is None else max(0.0, float(delay))
+
+        first = True
+        for _ in range(repeats):
+            for cmd in commands:
+                if not first:
+                    await asyncio.sleep(delay)
+                first = False
+                await call_client(self.coordinator.client.send_remote_command(cmd))

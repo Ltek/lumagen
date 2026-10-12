@@ -2,12 +2,13 @@
   "domain": "lumagen",
   "name": "Lumagen",
   "codeowners": [
-    "@jaysoffian"
+    "@Ltek"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/jaysoffian/ha-lumagen",
+  "documentation": "https://github.com/Ltek/lumagen",
   "integration_type": "device",
   "iot_class": "local_push",
+  "issue_tracker": "https://github.com/Ltek/lumagen/issues",
   "requirements": [],
-  "version": "0.0.1"
+  "version": "2026.10.12.1"
 }

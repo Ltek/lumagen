@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
+
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .client import LumagenConnectionError
 from .const import DOMAIN
 from .coordinator import LumagenCoordinator
+
+
+async def call_client(awaitable: Awaitable[None]) -> None:
+    """Await a client call, translating errors into HA exceptions."""
+    try:
+        await awaitable
+    except LumagenConnectionError as err:
+        raise HomeAssistantError(str(err)) from err
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
 
 
 class LumagenEntity(CoordinatorEntity[LumagenCoordinator]):
@@ -46,7 +60,7 @@ class LumagenEntity(CoordinatorEntity[LumagenCoordinator]):
         Availability tiers (subclasses override for their needs):
         - Base (sensor, select): requires connected AND power
         - Control (switch, button, remote): requires connected only
-        - Diagnostic sensors: requires connected only
+        - Diagnostic (link health): always available
         """
         data = self.coordinator.data
         self._attr_available = bool(

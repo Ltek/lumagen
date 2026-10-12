@@ -31,6 +31,7 @@ from client import (
     InputMemory,
     LabelCategory,
     LumagenClient,
+    LumagenConnectionError,
     LumagenState,
 )
 
@@ -531,7 +532,10 @@ class LumagenTUI(App[None]):
         if not raw:
             return
         self.query_one("#input-bar", CommandInput).add_to_history(raw)
-        await self._dispatch_command(raw)
+        try:
+            await self._dispatch_command(raw)
+        except LumagenConnectionError as err:
+            self.query_one("#log", RichLog).write(f"[red]{escape(str(err))}[/]")
 
     async def _dispatch_command(self, raw: str) -> None:
         log = self.query_one("#log", RichLog)

@@ -9,18 +9,23 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from homeassistant.helpers.typing import StateType
 
+from datetime import UTC, datetime
+
 from homeassistant.components.sensor import (
+    SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
+    SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .client import LumagenState
-from .const import DOMAIN
-from .coordinator import LumagenCoordinator
+from .client import LinkHealth, LumagenState
+from .coordinator import LumagenConfigEntry, LumagenCoordinator
 from .entity import LumagenEntity
+
+NITS = "nits"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -28,6 +33,17 @@ class LumagenSensorEntityDescription(SensorEntityDescription):
     """Describes Lumagen sensor entity."""
 
     value_fn: Callable[[LumagenState], StateType]
+
+
+@dataclass(frozen=True, kw_only=True)
+class LumagenHealthSensorEntityDescription(SensorEntityDescription):
+    """Describes a link-health diagnostic sensor (always available)."""
+
+    value_fn: Callable[[LinkHealth], StateType | datetime]
+
+
+def _timestamp(value: float | None) -> datetime | None:
+    return None if value is None else datetime.fromtimestamp(value, UTC)
 
 
 STATUS_SENSORS: tuple[LumagenSensorEntityDescription, ...] = (
@@ -196,19 +212,79 @@ STATUS_SENSORS: tuple[LumagenSensorEntityDescription, ...] = (
         icon="mdi:label-outline",
         value_fn=lambda data: data.input_label,
     ),
+    # HDR metadata (I52) — unknown while the source is SDR
+    LumagenSensorEntityDescription(
+        key="hdr_max_luminance",
+        translation_key="hdr_max_luminance",
+        icon="mdi:brightness-7",
+        native_unit_of_measurement=NITS,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+        value_fn=lambda data: data.hdr_max_luminance,
+    ),
+    LumagenSensorEntityDescription(
+        key="hdr_min_luminance",
+        translation_key="hdr_min_luminance",
+        icon="mdi:brightness-4",
+        native_unit_of_measurement=NITS,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=4,
+        entity_registry_enabled_default=False,
+        value_fn=lambda data: data.hdr_min_luminance,
+    ),
+    LumagenSensorEntityDescription(
+        key="hdr_max_cll",
+        translation_key="hdr_max_cll",
+        icon="mdi:white-balance-sunny",
+        native_unit_of_measurement=NITS,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+        value_fn=lambda data: data.hdr_max_cll,
+    ),
+)
+
+HEALTH_SENSORS: tuple[LumagenHealthSensorEntityDescription, ...] = (
+    LumagenHealthSensorEntityDescription(
+        key="last_data_received",
+        translation_key="last_data_received",
+        icon="mdi:clock-check-outline",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=lambda h: _timestamp(h.last_data_received),
+    ),
+    LumagenHealthSensorEntityDescription(
+        key="reconnects",
+        translation_key="reconnects",
+        icon="mdi:connection",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=lambda h: h.reconnects,
+    ),
+    LumagenHealthSensorEntityDescription(
+        key="last_disconnect_reason",
+        translation_key="last_disconnect_reason",
+        icon="mdi:lan-disconnect",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=lambda h: (h.last_disconnect_reason or "")[:255] or None,
+    ),
 )
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: LumagenConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Lumagen sensors."""
-    coordinator: LumagenCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
+    coordinator = entry.runtime_data
+    entities: list[SensorEntity] = [
         LumagenSensorEntity(coordinator, desc) for desc in STATUS_SENSORS
-    )
+    ]
+    entities.extend(LumagenHealthSensor(coordinator, desc) for desc in HEALTH_SENSORS)
+    async_add_entities(entities)
 
 
 class LumagenSensorEntity(LumagenEntity, SensorEntity):
@@ -229,3 +305,24 @@ class LumagenSensorEntity(LumagenEntity, SensorEntity):
         super()._update_attrs()
         data = self.coordinator.data
         self._attr_native_value = self.entity_description.value_fn(data)
+
+
+class LumagenHealthSensor(LumagenEntity, SensorEntity):
+    """Link-health diagnostic sensor — available even when disconnected."""
+
+    entity_description: LumagenHealthSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: LumagenCoordinator,
+        description: LumagenHealthSensorEntityDescription,
+    ) -> None:
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{description.key}"
+
+    def _update_attrs(self) -> None:
+        self._attr_available = True
+        self._attr_native_value = self.entity_description.value_fn(
+            self.coordinator.client.health
+        )

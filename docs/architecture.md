@@ -55,7 +55,7 @@ candidates for HA entities because:
 
 | Setting         | Command  | Why excluded                                        |
 |-----------------|----------|-----------------------------------------------------|
-| Game mode       | ZY551    | Per-input, saved on device, no automation use case. |
+| Game mode (set) | ZY551    | Per-input, saved on device. Its state is shown read-only via `ZQI53` (Game Mode binary sensor). |
 | Min fan speed   | ZY552    | Global hardware setting. No query command — state lost on restart. |
 | Subtitle shift  | ZY553    | Per-input, no query command, no automation use case. |
 
@@ -98,7 +98,7 @@ when configured with "Report mode changes: Full v5" (unsolicited ZQI25).
 ZQS02 to discover actual power state.
 
 **Keepalive:** When the connection has been idle for 30 seconds (no data
-received at all), a probe is sent via `query_runtime()`:
+received at all — configurable), a probe is sent via `query_runtime()`:
 - **Device on:** ZQI25+ZQI54 — full signal state + auto aspect
 - **Device off/unknown:** ZQS02 — power status check
 
@@ -116,27 +116,26 @@ next device response confirm or correct it.
 - Aspect ratio selection (non-NLS): set immediately, confirmed by I54 + I25 queries
 
 **Authoritative only (multi-command or unreliable):**
-- NLS variants (1.33 NLS, 1.78 NLS, 1.85 NLS): send the base aspect
-  command followed by `N`, then query I54 + I25 for the final state. No
-  optimistic state is set because the device fires an intermediate I24
-  response after the base aspect command (before processing `N`) that
-  would overwrite it.
-- Reset auto aspect (ZY550): queries I54 + I25 afterward to get the
+- NLS button: sends `N`, then queries I25 for the final state. No
+  optimistic state is set.
+- Reset auto aspect button (ZY550): queries I54 + I25 afterward to get the
   device's actual state.
+- CMS / Style selects (ZY530): query I25 afterward. The CMS select sets the
+  SDR CMS while the source is SDR and the HDR CMS while it is HDR.
 
 #### NLS caveats
 
 NLS (Non-Linear Stretch) on the Lumagen remote is a two-button sequence:
-press an aspect ratio (1.33, 1.78, or 1.85) then press NLS. The
-integration replicates this by sending both commands.
+press an aspect ratio (1.33, 1.78, or 1.85) then press NLS. In the
+integration, pick the aspect ratio in the Aspect Ratio select, then press the
+NLS button.
 
 Known device-level issues:
 - **1.85 NLS is unreliable**: works roughly 50% of the time with a 1.78
   source. The device sets the aspect to 1.85 but sometimes does not
   engage NLS. This is a firmware limitation, not an integration bug.
 - **1.33 NLS and 1.78 NLS are reliable** in testing.
-- Selecting any aspect ratio (including NLS variants) disables auto
-  aspect. Selecting "Auto" re-enables it.
+- Selecting any aspect ratio disables auto aspect. Selecting "Auto" re-enables it.
 - "Reset auto aspect" clears NLS and re-enables auto aspect detection.
 
 #### Aspect / auto aspect interaction
@@ -145,7 +144,7 @@ Known device-level issues:
 |---------------------|-------------|--------|---------------------|
 | Select "Auto"       | On          | Off    | (device-detected)   |
 | Select a ratio      | Off         | Off    | Set to selection    |
-| Select NLS variant  | Off         | On*    | Set to base ratio   |
+| Press NLS           | —           | On*    | —                   |
 | Reset auto aspect   | On          | Off    | (device-detected)   |
 | Toggle auto aspect  | Toggled     | —      | —                   |
 
@@ -153,8 +152,10 @@ Known device-level issues:
 
 ### Startup sequence
 
-1. Connect to device, wait for TCP session (response-driven `wait_for`,
-   5 s timeout).
+1. Connect to the adapter and verify the Lumagen answers `ZQS00`
+   (3 s). A failure disconnects and raises `ConfigEntryNotReady` (HA
+   retries). Any failure later in setup also disconnects first, so no
+   orphaned socket holds a single-client adapter's slot.
 2. Load config state from HA storage (identity, labels) to seed device
    info before device responds.
 3. If no stored config exists (first setup), `query_config()` sends
@@ -178,13 +179,54 @@ sequence already handles this case.
 
 ### Connection lifecycle
 
-- **Keepalive timeout:** If the probe gets no response within 5 seconds
-  (and no other data arrives), the connection is considered dead and a
-  reconnect is initiated.
-- **Reconnect:** Exponential backoff (1s, 2s, 4s, ... up to 30s). On
-  reconnect, power is re-fetched; if on, the keepalive handles ZQI25.
+- **Verified connect:** `connected` becomes True only after the Lumagen
+  answers `ZQS00` through the adapter. An adapter that accepts TCP but
+  passes no data (wedged, wrong serial settings, IP conflict) is reported as
+  disconnected. The same check tells us whether Echo-RS232 is on.
+- **Generations:** every TCP connection gets a generation number and its
+  own reader. A read loop can only tear down its own generation, so a stale
+  socket from an earlier connection never kills a newer one.
+- **Hard teardown:** sockets are aborted (TCP RST), not closed gracefully,
+  so single-client adapters (iTach in its default mode) free the slot
+  immediately. TCP keepalive is enabled on the socket as well.
+- **Liveness:** every received byte, including command echo (which has no
+  line terminator), updates the idle timer.
+- **Send watchdog** (option; default Auto): after a command, at least one
+  byte must arrive within 2 s or the link is considered dead.
+  - *Echo*: relies on the Lumagen echoing the command.
+  - *Query*: appends `ZQS00` to each command (works with Echo off).
+  - *Auto*: echo if detected at connect, otherwise query.
+  - *Off*: keepalive only.
+  Power on/off commands suspend the watchdog for 30 s while the device
+  boots or shuts down.
+- **Keepalive:** after 30 s (configurable) of silence, `query_runtime()` is
+  sent; no reply within 5 s → reconnect.
+- **Reconnect:** exponential backoff 1 s → 60 s. Backoff resets only after a
+  *verified* connection, so a wedged adapter doesn't cause a tight loop.
   Power state is NOT reset to None on disconnect, avoiding spurious
   power-on detection.
-- **Idle tracking:** Uses `time.monotonic()` timestamp updated on every
-  received line, not per-response events. This prevents false keepalive
-  timeouts when the device is slow to respond (e.g., after boot).
+- **Errors:** commands sent while disconnected raise
+  `LumagenConnectionError`, surfaced in HA as an error on the action.
+- **Health:** `LinkHealth` (disconnects, reconnects, consecutive failures,
+  last reason, echo detected, watchdog mode, last data time) feeds the
+  Connected binary sensor, diagnostic sensors and diagnostics download. The
+  last 50 sent/received lines are kept for diagnostics.
+
+### Follow-up queries
+
+When an I21–I25 report shows a new input, memory, resolution, rate, or
+dynamic range, the client queries game mode (`ZQI53`) and, for HDR
+sources, HDR metadata (`ZQI52`) 0.5 s later. HDR metadata is cleared when
+the source is SDR.
+
+### Volume OSD
+
+`volume_osd.py` follows a volume entity (number / input_number / sensor /
+media_player) and an optional mute entity, rendering with the pattern
+builder in `osd_pattern.py` (pure functions, fully unit-tested). It ignores
+transitions from/to unavailable/unknown, always clears a persistent mute on
+unmute, coalesces rapid changes, skips repeats, and only sends while the
+Lumagen is connected and on.
+
+`ZB` (block character) may persist on the device, so once a message has
+used it, later messages re-point it at a character not in their text.

@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -43,6 +45,7 @@ ASPECT_COMMANDS: dict[str, str] = {
     "Letterbox": "l",
     "1.33": "n",
     "1.37": "+l",
+    "1.66": "+w",
     "1.78": "w",
     "1.85": "j",
     "1.90": "A",
@@ -207,6 +210,12 @@ class LumagenState:
 
     # Config
     auto_aspect: bool | None = None
+    game_mode: bool | None = None
+
+    # HDR metadata (I52) — only populated while the source is HDR
+    hdr_min_luminance: float | None = None  # nits
+    hdr_max_luminance: int | None = None  # nits
+    hdr_max_cll: int | None = None  # nits
 
     # Labels (populated by _query_labels / set_label)
     _labels: LabelDict = field(default_factory=LabelDict)
@@ -245,6 +254,11 @@ class LumagenState:
         if self.output_style is None:
             return None
         return self._labels.get(f"3{self.output_style}")
+
+    @property
+    def labels(self) -> dict[str, str]:
+        """Copy of all cached labels."""
+        return dict(self._labels)
 
     def labels_by_prefix(self, prefix: str) -> dict[str, str]:
         """Return sorted labels whose key starts with *prefix*."""
@@ -421,6 +435,41 @@ def _on_full_info(state: LumagenState, fields: list[str]) -> None:
     state.power = fields[24] == "1"
 
 
+# Responses that describe the current signal; a change in input or dynamic
+# range triggers a follow-up query for game mode and HDR metadata.
+_SIGNAL_CODES = frozenset({"I21", "I22", "I23", "I24", "I25"})
+
+
+@_on("I52")
+def _on_hdr_status(state: LumagenState, fields: list[str]) -> None:
+    """I52 — HDR status: V,Min,Max,Cll (Radiance Pro only).
+
+    V=0: not HDR (Min/Max/Cll read ".0000,0,0").  V=1: source mastering
+    min/max luminance and MaxCLL, in nits.
+    """
+    if len(fields) < 4:
+        return
+    if fields[0] != "1":
+        state.hdr_min_luminance = None
+        state.hdr_max_luminance = None
+        state.hdr_max_cll = None
+        return
+    try:
+        state.hdr_min_luminance = float(fields[1])
+    except ValueError:
+        state.hdr_min_luminance = None
+    state.hdr_max_luminance = _safe_int(fields[2])
+    state.hdr_max_cll = _safe_int(fields[3])
+
+
+@_on("I53")
+def _on_game_mode(state: LumagenState, fields: list[str]) -> None:
+    """I53 — game mode (0=off, 1=on)."""
+    if not fields:
+        return
+    state.game_mode = fields[0] == "1"
+
+
 @_on("I54")
 def _on_auto_aspect(state: LumagenState, fields: list[str]) -> None:
     """I54 — auto aspect status (fw ≥041824)."""
@@ -434,23 +483,113 @@ def _on_auto_aspect(state: LumagenState, fields: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-class LumagenClient:
-    """Async TCP client for a Lumagen Radiance Pro."""
+class LumagenConnectionError(Exception):
+    """Raised when a command cannot be delivered because the link is down."""
 
-    def __init__(self, host: str, port: int) -> None:
+
+WatchdogMode = Literal["auto", "echo", "query", "off"]
+WATCHDOG_MODES: tuple[WatchdogMode, ...] = get_args(WatchdogMode)
+
+# Commands that put the Lumagen into a long-running transition (boot / shutdown)
+# during which it may be slow to answer.  The send watchdog is suspended for
+# POWER_GRACE seconds after either is sent.
+_POWER_COMMANDS = frozenset({"%", "$"})
+POWER_GRACE = 30.0
+
+
+# Block-character candidates for ZB, in order of preference.
+_BLOCK_CANDIDATES = "X#@&*=+QWZVKJ^"
+
+
+def pick_block_char(text: str) -> str:
+    """Return a ZB block character that does not occur in *text*."""
+    for c in _BLOCK_CANDIDATES:
+        if c not in text:
+            return c
+    for code in range(0x7A, 0x20, -1):
+        if chr(code) not in text:
+            return chr(code)
+    return "X"
+
+
+@dataclass
+class LinkHealth:
+    """Connection health counters (exposed as diagnostic entities)."""
+
+    connected_since: float | None = None  # wall-clock time.time()
+    last_data_received: float | None = None  # wall-clock time.time()
+    last_disconnect: float | None = None  # wall-clock time.time()
+    last_disconnect_reason: str | None = None
+    disconnects: int = 0
+    reconnects: int = 0
+    consecutive_failures: int = 0
+    echo_detected: bool | None = None
+    watchdog_mode: str | None = None  # resolved mode: echo / query / off
+
+
+class LumagenClient:
+    """Async TCP client for a Lumagen Radiance Pro.
+
+    Connection model:
+
+    - Each TCP connection gets a *generation* number.  The read loop for a
+      connection only acts on (and can only tear down) its own generation, so a
+      stale socket from an earlier connection can never kill a newer one.
+    - ``connected`` becomes True only after the Lumagen answers ``ZQS00`` —
+      a TCP adapter that accepts connections but passes no data is reported as
+      disconnected.
+    - Teardown aborts the transport (TCP RST) instead of a graceful close, so
+      adapters that allow a single client (e.g. Global Cache iTach in its
+      default mode) free the slot immediately.
+    - Liveness is tracked per received byte (including command echo).  An
+      optional send watchdog reconnects if nothing comes back shortly after a
+      command; see ``watchdog``.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        watchdog: WatchdogMode = "auto",
+        watchdog_timeout: float = 2.0,
+        keepalive_interval: float = 30.0,
+        verify_timeout: float = 3.0,
+        connect_timeout: float = 10.0,
+        max_backoff: float = 60.0,
+    ) -> None:
+        if watchdog not in WATCHDOG_MODES:
+            raise ValueError(f"Invalid watchdog mode: {watchdog!r}")
         self.state = LumagenState()
+        self.health = LinkHealth()
+        self.traffic: deque[tuple[float, str, str]] = deque(maxlen=50)
         self._host = host
         self._port = port
+        self._watchdog_setting: WatchdogMode = watchdog
+        self._watchdog_mode: WatchdogMode = "off"  # resolved after verify
+        self._watchdog_timeout = watchdog_timeout
+        self._keepalive_interval = keepalive_interval
+        self._probe_timeout = 5.0
+        self._verify_timeout = verify_timeout
+        self._connect_timeout = connect_timeout
+        self._max_backoff = max_backoff
         self._on_state_changed: Callable[[], None] | None = None
         self._on_connection_changed: Callable[[bool], None] | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._gen = 0
         self._read_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._followup_task: asyncio.Task[None] | None = None
         self._running = False
         self._disconnecting = False
         self._last_recv: float = 0.0
+        self._rx_event = asyncio.Event()
+        self._alive_waiter: asyncio.Future[bool] | None = None
+        self._power_grace_until: float = 0.0
+        self._block_char_used = False
         self._write_lock = asyncio.Lock()
         self._label_lock = asyncio.Lock()
         self._pending_label_event: asyncio.Event | None = None
@@ -460,24 +599,43 @@ class LumagenClient:
             self._handlers[code] = self._on_label
         self._last_power: bool | None = None
         self._power_on_task: asyncio.Task[None] | None = None
+        self._signal_key: tuple[object, ...] | None = None
         self._state_waiters: list[
             tuple[asyncio.Event, Callable[[LumagenState], bool]]
         ] = []
 
     # -- Connection lifecycle -----------------------------------------------
 
+    @property
+    def host(self) -> str:
+        """Configured host."""
+        return self._host
+
+    @property
+    def port(self) -> int:
+        """Configured port."""
+        return self._port
+
     async def connect(
         self,
         on_state_changed: Callable[[], None] | None = None,
         on_connection_changed: Callable[[bool], None] | None = None,
-    ) -> None:
-        """Connect to the Lumagen device and start background tasks."""
+    ) -> bool:
+        """Connect, verify the device answers, and start background tasks.
+
+        Returns True if the device answered.  A failed first attempt does not
+        start the reconnect loop; the caller (HA setup) retries instead.
+        """
         self._on_state_changed = on_state_changed
         self._on_connection_changed = on_connection_changed
-        await self._open_connection()
+        self._running = True
+        if await self._open_connection():
+            return True
+        self._running = False
+        return False
 
     async def disconnect(self) -> None:
-        """Shut down cleanly."""
+        """Shut down cleanly: stop all tasks and abort the socket."""
         self._running = False
         tasks = [
             t
@@ -486,119 +644,235 @@ class LumagenClient:
                 self._keepalive_task,
                 self._read_task,
                 self._power_on_task,
+                self._watchdog_task,
+                self._followup_task,
             )
-            if t and not t.done()
+            if t and not t.done() and t is not asyncio.current_task()
         ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if self._writer:
-            with suppress(Exception):
-                self._writer.close()
-                await self._writer.wait_closed()
+        self._abort_transport()
+        self.state.connected = False
+        self.health.connected_since = None
+
+    def _abort_transport(self) -> None:
+        """Hard-close the socket (RST) and forget reader/writer."""
+        writer = self._writer
         self._reader = None
         self._writer = None
-        self.state.connected = False
+        if writer is not None:
+            with suppress(Exception):
+                writer.transport.abort()
 
-    async def _open_connection(self) -> None:
-        """Open TCP socket and spin up read + keepalive tasks."""
+    def _cancel_connection_tasks(self) -> None:
+        """Cancel per-connection tasks (never the calling task)."""
+        current = asyncio.current_task()
+        for task in (self._read_task, self._keepalive_task, self._watchdog_task):
+            if task and not task.done() and task is not current:
+                task.cancel()
+
+    @staticmethod
+    def _configure_socket(writer: asyncio.StreamWriter) -> None:
+        """Enable TCP keepalive so the OS also notices dead peers."""
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return
+        with suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for name, value in (
+                ("TCP_KEEPIDLE", 60),
+                ("TCP_KEEPINTVL", 10),
+                ("TCP_KEEPCNT", 3),
+            ):
+                opt = getattr(socket, name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+
+    async def _open_connection(self) -> bool:
+        """Open TCP, verify the device answers ZQS00, start tasks.
+
+        Returns True when the device is verified alive.
+        """
+        self._cancel_connection_tasks()
+        self._abort_transport()
         try:
-            self._reader, self._writer = await asyncio.wait_for(
+            reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self._host, self._port),
-                timeout=10.0,
+                timeout=self._connect_timeout,
             )
         except (TimeoutError, OSError) as err:
-            _LOGGER.error("Failed to connect to %s:%s: %s", self._host, self._port, err)
-            self.state.connected = False
-            if self._on_connection_changed:
-                self._on_connection_changed(False)
-            return
+            return self._connect_failed(f"connect failed: {err or type(err).__name__}")
 
-        _LOGGER.info("Connected to %s:%s", self._host, self._port)
-        self._running = True
+        self._configure_socket(writer)
+        self._gen += 1
+        gen = self._gen
+        self._reader, self._writer = reader, writer
+        self._read_task = asyncio.create_task(self._read_loop(reader, gen))
+
+        # Verify the device is actually reachable through the adapter.
+        loop = asyncio.get_running_loop()
+        self._alive_waiter = loop.create_future()
+        self.health.echo_detected = None
+        alive = False
+        try:
+            await self._write_raw("ZQS00")
+            alive = await asyncio.wait_for(
+                asyncio.shield(self._alive_waiter), self._verify_timeout
+            )
+        except (TimeoutError, OSError, ConnectionError):
+            alive = False
+        finally:
+            self._alive_waiter = None
+
+        if not alive or gen != self._gen:
+            self._cancel_connection_tasks()
+            self._abort_transport()
+            return self._connect_failed("no response from Lumagen (ZQS00)")
+
+        self._watchdog_mode = self._resolve_watchdog()
+        self.health.watchdog_mode = self._watchdog_mode
+        self.health.consecutive_failures = 0
+        self.health.connected_since = time.time()
+        _LOGGER.info(
+            "Connected to %s:%s (echo=%s, watchdog=%s)",
+            self._host,
+            self._port,
+            self.health.echo_detected,
+            self._watchdog_mode,
+        )
         self.state.power = None
+        self._signal_key = None
         self.state.connected = True
-        self._read_task = asyncio.create_task(self._read_loop())
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop(gen))
         if self._on_connection_changed:
             self._on_connection_changed(True)
+        return True
 
-    async def _on_disconnect(self) -> None:
-        """Tear down current connection and start reconnect loop."""
+    def _connect_failed(self, reason: str) -> bool:
+        self.health.consecutive_failures += 1
+        self.health.last_disconnect_reason = reason
+        level = (
+            logging.WARNING if self.health.consecutive_failures <= 1 else logging.DEBUG
+        )
+        _LOGGER.log(level, "%s:%s — %s", self._host, self._port, reason)
+        self.state.connected = False
+        if self._on_connection_changed:
+            self._on_connection_changed(False)
+        return False
+
+    def _resolve_watchdog(self) -> WatchdogMode:
+        if self._watchdog_setting != "auto":
+            return self._watchdog_setting
+        return "echo" if self.health.echo_detected else "query"
+
+    async def _on_disconnect(self, reason: str = "connection lost") -> None:
+        """Tear down the current connection and start the reconnect loop."""
         if not self._running or self._disconnecting:
             return
-        _LOGGER.info("Disconnected from %s:%s", self._host, self._port)
         self._disconnecting = True
+        try:
+            _LOGGER.warning(
+                "Disconnected from %s:%s (%s)", self._host, self._port, reason
+            )
+            self._cancel_connection_tasks()
+            self._abort_transport()
 
-        # Cancel any in-progress reconnect before starting a new one
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._reconnect_task
+            was_connected = self.state.connected
+            self.state.connected = False
+            self.health.connected_since = None
+            self.health.last_disconnect = time.time()
+            self.health.last_disconnect_reason = reason
+            if was_connected:
+                self.health.disconnects += 1
+                if self._on_connection_changed:
+                    self._on_connection_changed(False)
+                self._notify_listeners()
 
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-        if self._writer:
-            with suppress(Exception):
-                self._writer.close()
-        self._reader = None
-        self._writer = None
-
-        was_connected = self.state.connected
-        self.state.connected = False
-
-        if was_connected:
-            if self._on_connection_changed:
-                self._on_connection_changed(False)
-            self._notify_listeners()
-
-        # Start reconnect
-        self._disconnecting = False
-        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+            current = asyncio.current_task()
+            if (
+                self._reconnect_task
+                and not self._reconnect_task.done()
+                and self._reconnect_task is not current
+            ):
+                self._reconnect_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._reconnect_task
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        finally:
+            self._disconnecting = False
 
     async def _reconnect_loop(self) -> None:
-        """Retry the TCP connection with exponential backoff (1s → 30s max)."""
+        """Retry with exponential backoff until the device is verified alive.
+
+        Backoff only resets after a *verified* connection, so an adapter that
+        accepts TCP but passes no data does not cause a tight retry loop.
+        """
         delay = 1.0
         while self._running:
-            _LOGGER.info(
-                "Attempting reconnect to %s:%s in %.0fs", self._host, self._port, delay
+            _LOGGER.debug(
+                "Reconnecting to %s:%s in %.0fs", self._host, self._port, delay
             )
             await asyncio.sleep(delay)
             if not self._running:
                 return
-            await self._open_connection()
-            if self.state.connected:
+            if await self._open_connection():
+                self.health.reconnects += 1
                 _LOGGER.info("Reconnected to %s:%s", self._host, self._port)
-                await self.query_runtime()
+                with suppress(LumagenConnectionError):
+                    await self.query_runtime()
                 return
-            delay = min(delay * 2, 30.0)
+            delay = min(delay * 2, self._max_backoff)
 
     # -- Read loop ----------------------------------------------------------
 
-    async def _read_loop(self) -> None:
-        """Read lines from the device and dispatch to handlers."""
-        while self._running and self._reader:
+    async def _read_loop(self, reader: asyncio.StreamReader, gen: int) -> None:
+        """Read bytes for one connection generation and dispatch lines.
+
+        Every received byte (including command echo, which has no line
+        terminator) counts as proof of liveness.
+        """
+        buf = b""
+        reason = "connection closed by peer"
+        while self._running and gen == self._gen:
             try:
-                line = await self._reader.readline()
-                if not line:  # EOF
-                    break
-                text = line.decode("ascii", errors="ignore").strip()
-                if text:
-                    self._last_recv = time.monotonic()
-                    _LOGGER.debug("recv: %s", text)
-                    self._on_readline(text)
+                chunk = await reader.read(1024)
             except asyncio.CancelledError:
                 return
-            except (OSError, ConnectionError):
+            except (OSError, ConnectionError) as err:
+                reason = f"read error: {err}"
                 break
-            except Exception:
-                _LOGGER.exception("Read loop error")
+            if not chunk:  # EOF
                 break
+            if gen != self._gen:
+                return
+            self._last_recv = time.monotonic()
+            self.health.last_data_received = time.time()
+            self._rx_event.set()
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            if len(buf) > 4096:  # runaway echo without terminator
+                buf = buf[-1024:]
+            for raw in lines:
+                text = raw.decode("ascii", errors="ignore").strip()
+                if not text:
+                    continue
+                _LOGGER.debug("recv: %s", text)
+                self.traffic.append((time.time(), "rx", text))
+                try:
+                    self._on_readline(text)
+                except Exception:
+                    _LOGGER.exception("Error processing line %r", text)
 
-        if self._running:
-            await self._on_disconnect()
+        if not self._running or gen != self._gen:
+            return  # stale or shutting down: never touch a newer connection
+        if not self.state.connected:
+            # Still verifying — fail the verification instead of reconnecting.
+            if self._alive_waiter and not self._alive_waiter.done():
+                self._alive_waiter.set_result(False)
+            return
+        await self._on_disconnect(reason)
 
     def _on_readline(self, line: str) -> None:
         """Parse a single line from the TCP stream."""
@@ -618,6 +892,9 @@ class LumagenClient:
             return
 
         name, fields = match.groups()
+        if name == "S00":
+            self._on_alive(line[: match.start()])
+            return
         if name not in self._handlers:
             return
 
@@ -626,39 +903,70 @@ class LumagenClient:
         except Exception:
             _LOGGER.exception("Error in handler for %s", name)
         else:
+            if name in _SIGNAL_CODES:
+                self._check_signal_followup()
             self._notify_listeners()
 
-    # -- Keepalive ----------------------------------------------------------
+    def _on_alive(self, prefix: str) -> None:
+        """Handle ``!S00,Ok``; *prefix* is whatever preceded it on the line."""
+        waiter = self._alive_waiter
+        if waiter and not waiter.done():
+            self.health.echo_detected = "ZQS00" in prefix
+            waiter.set_result(True)
 
-    async def _keepalive_loop(self) -> None:
-        """Probe connection after 30 s of idle.
+    # -- Keepalive / watchdog -----------------------------------------------
 
-        Uses query_runtime which pipelines ZQI25+ZQI54 when the device
-        is on and sends ZQS02 when off.
-        """
-        interval = 30
-        probe_timeout = 5
-        while self._running:
+    async def _keepalive_loop(self, gen: int) -> None:
+        """Probe the link after ``keepalive_interval`` seconds of silence."""
+        interval = self._keepalive_interval
+        while self._running and gen == self._gen:
             try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 return
-            if not self._running:
+            if not self._running or gen != self._gen:
                 return
-            # If we received data recently, no probe needed
-            idle = time.monotonic() - self._last_recv
-            if idle < interval:
+            if time.monotonic() - self._last_recv < interval:
                 continue
             before = self._last_recv
+            self._rx_event.clear()
             try:
                 await self.query_runtime()
-                await asyncio.sleep(probe_timeout)
+                await asyncio.wait_for(self._rx_event.wait(), self._probe_timeout)
             except asyncio.CancelledError:
                 return
-            if self._last_recv == before:
-                _LOGGER.warning("Keepalive timeout — reconnecting")
-                await self._on_disconnect()
+            except (TimeoutError, LumagenConnectionError):
+                pass
+            if gen != self._gen:
                 return
+            if self._last_recv == before:
+                await self._on_disconnect("keepalive timeout")
+                return
+
+    def _arm_watchdog(self, sent_at: float, cmd: str) -> None:
+        """After a send, expect at least one byte back within the timeout."""
+        if cmd in _POWER_COMMANDS:
+            self._power_grace_until = sent_at + POWER_GRACE
+            return
+        if self._watchdog_mode == "off" or sent_at < self._power_grace_until:
+            return
+        if self._watchdog_task and not self._watchdog_task.done():
+            return  # an earlier send is already being watched
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_check(sent_at, self._gen)
+        )
+
+    async def _watchdog_check(self, sent_at: float, gen: int) -> None:
+        try:
+            await asyncio.sleep(self._watchdog_timeout)
+        except asyncio.CancelledError:
+            return
+        if gen != self._gen or not self.state.connected:
+            return
+        if self._last_recv < sent_at:
+            await self._on_disconnect(
+                f"no response within {self._watchdog_timeout:g}s of a command"
+            )
 
     # -- Sending ------------------------------------------------------------
 
@@ -666,19 +974,36 @@ class LumagenClient:
         """Send an arbitrary RS232 command string (public, for debug tools)."""
         await self._send_command(cmd)
 
-    async def _send_command(self, cmd: str) -> None:
-        """Send a raw ASCII command string to the device (no framing)."""
-        if not self._writer:
-            _LOGGER.warning("Cannot send — not connected")
-            return
+    async def _write_raw(self, payload: str) -> None:
+        """Write bytes to the current socket (no connected check)."""
+        writer = self._writer
+        if writer is None:
+            raise LumagenConnectionError("Not connected to Lumagen")
         async with self._write_lock:
-            try:
-                _LOGGER.debug("send: %s", cmd)
-                self._writer.write(cmd.encode("ascii"))
-                await self._writer.drain()
-            except (OSError, ConnectionError) as err:
-                _LOGGER.error("Send error: %s", err)
-                await self._on_disconnect()
+            _LOGGER.debug("send: %s", payload)
+            self.traffic.append((time.time(), "tx", payload))
+            writer.write(payload.encode("ascii"))
+            await asyncio.wait_for(writer.drain(), timeout=5.0)
+
+    async def _send_command(self, cmd: str) -> None:
+        """Send a raw ASCII command string to the device (no framing).
+
+        Raises LumagenConnectionError if the link is down or the write fails.
+        """
+        if not self.state.connected or self._writer is None:
+            raise LumagenConnectionError(
+                f"Not connected to Lumagen at {self._host}:{self._port}"
+            )
+        payload = cmd
+        if self._watchdog_mode == "query" and cmd not in _POWER_COMMANDS:
+            payload = f"{cmd}ZQS00"  # guarantees a reply to prove delivery
+        sent_at = time.monotonic()
+        try:
+            await self._write_raw(payload)
+        except (OSError, ConnectionError, TimeoutError) as err:
+            await self._on_disconnect(f"send error: {err or type(err).__name__}")
+            raise LumagenConnectionError(f"Send to Lumagen failed: {err}") from err
+        self._arm_watchdog(sent_at, cmd)
 
     def _notify_listeners(self) -> None:
         """Notify state-change callback and wake any wait_for waiters."""
@@ -717,8 +1042,43 @@ class LumagenClient:
             _LOGGER.info("Device already on — querying runtime state")
         try:
             await self.query_runtime()
+        except LumagenConnectionError:
+            _LOGGER.debug("Skipped power-on refresh: not connected")
         except Exception:
             _LOGGER.exception("Error querying state after power-on")
+
+    def _check_signal_followup(self) -> None:
+        """Query game mode / HDR metadata when the input or signal changes."""
+        s = self.state
+        key = (
+            s.logical_input,
+            s.input_memory,
+            s.source_dynamic_range,
+            s.source_vertical_resolution,
+            s.source_vertical_rate,
+        )
+        if key == self._signal_key:
+            return
+        self._signal_key = key
+        if s.source_dynamic_range != "HDR":
+            s.hdr_min_luminance = None
+            s.hdr_max_luminance = None
+            s.hdr_max_cll = None
+        if not s.power or not s.connected:
+            return
+        if self._followup_task and not self._followup_task.done():
+            self._followup_task.cancel()
+        self._followup_task = asyncio.create_task(self._signal_followup())
+
+    async def _signal_followup(self) -> None:
+        try:
+            await asyncio.sleep(0.5)  # let a burst of mode-change reports settle
+            cmd = "ZQI53"
+            if self.state.source_dynamic_range == "HDR":
+                cmd += "ZQI52"
+            await self._send_command(cmd)
+        except (asyncio.CancelledError, LumagenConnectionError):
+            return
 
     async def wait_for(
         self,
@@ -955,6 +1315,21 @@ class LumagenClient:
         """Strip characters outside the legal OSD range (0x20-0x7A)."""
         return "".join(c for c in text if 0x20 <= ord(c) <= 0x7A)
 
+    def _block_prefix(self, payload: str, block_char: str) -> str:
+        """Return the ZB prefix for a message.
+
+        The ZB remap may persist on the device, so once any message has used a
+        block character, later messages re-point ZB at a character that does
+        not occur in their text.  Otherwise a plain message containing e.g.
+        ``X`` could render that letter as a solid block.
+        """
+        if block_char:
+            self._block_char_used = True
+            return f"ZB{block_char}"
+        if self._block_char_used:
+            return f"ZB{pick_block_char(payload)}"
+        return ""
+
     async def show_osd_message(
         self,
         line_one: str,
@@ -998,8 +1373,9 @@ class LumagenClient:
         # 0 = persistent (protocol digit 9), 1-8 = seconds
         digit = 9 if duration == 0 else max(1, min(8, duration))
         payload = f"{line_one:<30}{line_two}" if line_two else line_one
-        prefix = f"ZB{block_char}" if block_char else ""
-        await self._send_command(f"{prefix}ZT{digit}{payload}\r")
+        await self._send_command(
+            f"{self._block_prefix(payload, block_char)}ZT{digit}{payload}\r"
+        )
 
     async def show_osd_volume_bar(self, level: float, label: str | None = None) -> None:
         """
@@ -1031,7 +1407,12 @@ class LumagenClient:
                 label = "Max"
             else:
                 label = f"{level:.1%}"
-        await self._send_command(f"ZBXZT1{label:<5.5} {'X' * int(level * 24):<24}\r")
+        label = self._sanitize_osd_text(label)[:5]
+        block = pick_block_char(label)
+        await self._send_command(
+            f"ZB{block}ZT1{label:<5.5} {block * int(level * 24):<24}\r"
+        )
+        self._block_char_used = True
 
     async def clear_osd_message(self) -> None:
         """Clear any OSD message."""
@@ -1045,6 +1426,79 @@ class LumagenClient:
         await self._send_command(f"{cmd}ZQI54")
 
     # -- Misc ---------------------------------------------------------------
+
+    async def reset_auto_aspect(self) -> None:
+        """Reset and re-initiate automatic aspect detection (ZY550)."""
+        await self._send_command("ZY550\rZQI54ZQI25")
+
+    async def hotplug(self, hdmi_input: int | None = None) -> None:
+        """Toggle HDMI hotplug so sources re-read the EDID (ZY520).
+
+        *hdmi_input*: physical HDMI input 1-8, or None for all inputs.
+        """
+        if hdmi_input is None:
+            arg = "A"
+        elif 1 <= hdmi_input <= 8:
+            arg = str(hdmi_input - 1)
+        else:
+            raise ValueError(f"HDMI input must be 1-8, got {hdmi_input}")
+        await self._send_command(f"ZY520{arg}\r")
+
+    async def set_output_config(
+        self,
+        *,
+        mode: int | None = None,
+        cms_sdr: int | None = None,
+        cms_hdr: int | None = None,
+        style: int | None = None,
+    ) -> None:
+        """Select output mode, CMS (SDR and/or HDR) and style (ZY530MCDS).
+
+        Any argument left as None keeps the current value ('K').
+        """
+
+        def arg(value: int | None, name: str) -> str:
+            if value is None:
+                return "K"
+            if not 0 <= value <= 7:
+                raise ValueError(f"{name} must be 0-7, got {value}")
+            return str(value)
+
+        cmd = (
+            f"ZY530{arg(mode, 'mode')}{arg(cms_sdr, 'cms_sdr')}"
+            f"{arg(cms_hdr, 'cms_hdr')}{arg(style, 'style')}\r"
+        )
+        await self._send_command(f"{cmd}ZQI25")
+
+    async def set_cms(self, cms: int) -> None:
+        """Select the CMS for the dynamic range currently playing."""
+        if self.state.source_dynamic_range == "HDR":
+            await self.set_output_config(cms_hdr=cms)
+        else:
+            await self.set_output_config(cms_sdr=cms)
+
+    async def set_style(self, style: int) -> None:
+        """Select the output style."""
+        await self.set_output_config(style=style)
+
+    async def set_osd_colors(
+        self, foreground: str, background: str, blend: int
+    ) -> None:
+        """Set RS232 OSD message colors (ZY418, Radiance Pro only).
+
+        *foreground*/*background*: ``RRGGBB`` hex.  *blend*: 1 (near
+        transparent) to 15 (opaque).
+        """
+        for name, value in (("foreground", foreground), ("background", background)):
+            if not re.fullmatch(r"[0-9A-Fa-f]{6}", value):
+                raise ValueError(f"{name} must be RRGGBB hex, got {value!r}")
+        if not 1 <= blend <= 15:
+            raise ValueError(f"blend must be 1-15, got {blend}")
+        await self._send_command(
+            f"ZY4180{background.lower()}\r"
+            f"ZY4181{foreground.lower()}\r"
+            f"ZY418200000{blend:x}\r"
+        )
 
     async def save_config(self) -> None:
         """Save current configuration to flash."""

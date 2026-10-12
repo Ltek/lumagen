@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+Ltek version of jaysoffian/ha-lumagen. Upstream remote: `upstream` (https://github.com/jaysoffian/ha-lumagen). Versions are `YYYY.MM.DD.BUILD` in `manifest.json` + `CHANGELOG.md`; README carries a "Current build" pointer. No GitHub Actions — the repo is pushed manually.
+
 ## Git
 - Do NOT include Claude attribution in commit messages.
 - Always verify `git status` is clean before making changes.
@@ -7,7 +9,7 @@
 ## Verification
 - Use pre-commit hooks to verify work — do NOT run checkers (ruff, pyright, pytest, etc.) manually.
 - Run: `pre-commit run --all-files`
-- Run: `make hassfest` — validates manifest, config schema, translations, etc. via the HA hassfest container.
+- Run: `make hassfest` — validates manifest, config schema, translations, etc. via the HA hassfest container (mounts the repo root).
 
 ## Python
 - Always use `uv` to run Python, pytest, and tools (never bare `python` or `python3`).
