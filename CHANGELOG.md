@@ -4,6 +4,10 @@ Builds are numbered `YYYY.MM.DD.BUILD`. Everything before the first entry is the
 [jaysoffian/ha-lumagen](https://github.com/jaysoffian/ha-lumagen) history, preserved in this
 repository's git log (up to upstream commit `4f32791`, 2026-03-27).
 
+## v2026.10.30.2
+
+- New **Save Config** button (`button.<lumagen>_save_config`, configuration category): saves the Lumagen's current settings to flash (`ZY6SAVECONFIG`), so changes made from Home Assistant — CMS, Style, labels — survive a power cycle. Used by the Lumagen Card's *Save settings*.
+
 ## v2026.10.12.1
 
 First build of the Ltek version, forked from jaysoffian/ha-lumagen `4f32791`.

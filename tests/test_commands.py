@@ -71,6 +71,12 @@ class TestCommands:
             await client.hotplug(9)
 
     @pytest.mark.anyio
+    async def test_save_config(self):
+        client, sent = _client()
+        await client.save_config()
+        assert sent == ["ZY6SAVECONFIG\r"]
+
+    @pytest.mark.anyio
     async def test_reset_auto_aspect(self):
         client, sent = _client()
         await client.reset_auto_aspect()

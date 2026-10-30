@@ -51,6 +51,13 @@ BUTTONS: tuple[LumagenButtonEntityDescription, ...] = (
         press_fn=lambda c: c.client.reset_auto_aspect(),
     ),
     LumagenButtonEntityDescription(
+        key="save_config",
+        translation_key="save_config",
+        icon="mdi:content-save-cog",
+        entity_category=EntityCategory.CONFIG,
+        press_fn=lambda c: c.client.save_config(),
+    ),
+    LumagenButtonEntityDescription(
         key="hotplug_all",
         translation_key="hotplug_all",
         icon="mdi:video-input-hdmi",

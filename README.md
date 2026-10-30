@@ -4,7 +4,7 @@ This [integration](https://www.home-assistant.io/getting-started/concepts-termin
 
 > **Credit:** This integration is built on [**ha-lumagen** by Jay Soffian (@jaysoffian)](https://github.com/jaysoffian/ha-lumagen). Jay designed and wrote the original integration: the async RS-232 client, the event-driven state model, label handling, aspect-ratio and NLS logic, the OSD services, the TUI, and the RS-232 command reference in [`docs/`](docs/). This version adds connection hardening and new features on top of his work. The full upstream commit history is preserved in this repository, and it is distributed under the same [MIT license](LICENSE). If you only need the original feature set, please use and support [his repository](https://github.com/jaysoffian/ha-lumagen).
 
-Current build: **v2026.10.12.1** · full history in [CHANGELOG.md](CHANGELOG.md)
+Current build: **v2026.10.30.2** · full history in [CHANGELOG.md](CHANGELOG.md)
 
 ### What this version adds
 
@@ -113,6 +113,7 @@ Entities marked *(disabled by default)* below are created but off. Enable them o
 - **Reset Auto Aspect** *(disabled by default)* — Reset and restart automatic aspect detection (ZY550).
 - **Hotplug All Inputs** *(disabled by default)* — Toggle HDMI hotplug so sources re-read the EDID. Fixes "no picture / wrong format / no audio" without power-cycling the source. For a single input, use the `lumagen.hotplug` action.
 - **Restart outputs** — Restart outputs if your TV/projector has trouble locking on the signal.
+- **Save Config** — Save the Lumagen's current settings to flash, so changes made from Home Assistant (CMS, Style, labels) survive a power cycle.
 - **Reload config** — Reload configuration (identity, firmware revision, and labels) from your Lumagen. This queries all 64 labels sequentially and may take a minute or two to complete. There is no progress indication — verify by checking that labels or firmware version updated.
 
 ### Selects
@@ -123,7 +124,7 @@ Entities marked *(disabled by default)* below are created but off. Enable them o
 - **CMS** *(disabled by default)* — Select the output CMS (0–7, shown with your labels). While the source is SDR this sets the SDR CMS; while it is HDR it sets the HDR/Rec.2020 CMS (`ZY530`).
 - **Style** *(disabled by default)* — Select the output style (0–7, shown with your labels).
 
-Changes made with CMS / Style are not saved to the Lumagen's flash until you save the configuration on the device.
+Changes made with CMS / Style are not saved to the Lumagen's flash until you press **Save Config** (or save on the device).
 
 ### Binary sensors
 

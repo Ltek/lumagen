@@ -50,6 +50,9 @@
       },
       "restart_outputs": {
         "name": "Restart Outputs"
+      },
+      "save_config": {
+        "name": "Save Config"
       }
     },
     "remote": {},
