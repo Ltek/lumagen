@@ -4,7 +4,7 @@ This [integration](https://www.home-assistant.io/getting-started/concepts-termin
 
 > **Credit:** This integration is built on [**ha-lumagen** by Jay Soffian (@jaysoffian)](https://github.com/jaysoffian/ha-lumagen). Jay designed and wrote the original integration: the async RS-232 client, the event-driven state model, label handling, aspect-ratio and NLS logic, the OSD services, the TUI, and the RS-232 command reference in [`docs/`](docs/). This version adds connection hardening and new features on top of his work. The full upstream commit history is preserved in this repository, and it is distributed under the same [MIT license](LICENSE). If you only need the original feature set, please use and support [his repository](https://github.com/jaysoffian/ha-lumagen).
 
-Current build: **v2026.10.30.2** · full history in [CHANGELOG.md](CHANGELOG.md)
+Full history in [CHANGELOG.md](CHANGELOG.md).
 
 ### What this version adds
 

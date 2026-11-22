@@ -494,8 +494,9 @@ WATCHDOG_MODES: tuple[WatchdogMode, ...] = get_args(WatchdogMode)
 # during which it may be slow to answer.  The send watchdog is suspended for
 # POWER_GRACE seconds after either is sent.
 _POWER_COMMANDS = frozenset({"%", "$"})
-# After a power command the unit is busy booting (or shutting down) and may not answer: no watchdog for this
-# long. A Radiance Pro can take over a minute to come up.
+# After a power command the unit is busy booting (or shutting down) and may
+# not answer: no watchdog for this long. A Radiance Pro can take over a
+# minute to come up.
 POWER_GRACE = 90.0
 
 
@@ -967,8 +968,9 @@ class LumagenClient:
             return
         if self._last_recv >= sent_at:
             return
-        # One missed reply is not a dead link: a busy unit (booting, switching inputs) can be late. Ask once more
-        # and give it the same time again before dropping the connection.
+        # One missed reply is not a dead link: a busy unit (booting, switching
+        # inputs) can be late. Ask once more and give it the same time again
+        # before dropping the connection.
         before = self._last_recv
         self._rx_event.clear()
         try:
@@ -982,7 +984,8 @@ class LumagenClient:
             return
         if self._last_recv == before:
             await self._on_disconnect(
-                f"no response within {self._watchdog_timeout:g}s of a command, nor to a second probe"
+                f"no response within {self._watchdog_timeout:g}s of a command,"
+                " nor to a second probe"
             )
 
     # -- Sending ------------------------------------------------------------

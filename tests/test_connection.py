@@ -249,7 +249,8 @@ class TestWatchdog:
             client = _client(fake.port)
             try:
                 assert await client.connect()
-                fake.mode = "drop_next"  # the unit misses one reply, then answers the probe
+                # The unit misses one reply, then answers the probe
+                fake.mode = "drop_next"
                 await client.send_remote_command("menu")
                 await asyncio.sleep(1.0)
                 assert client.state.connected
