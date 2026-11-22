@@ -60,6 +60,9 @@ class FakeAdapter:
                 self.received.append(data)
                 if self.mode == "wedged":
                     continue
+                if self.mode == "drop_next":  # late once (a busy unit), then fine
+                    self.mode = "echo"
+                    continue
                 out = data if self.mode == "echo" else b""
                 buf += data
                 for query, reply in (
@@ -237,6 +240,20 @@ class TestWatchdog:
                 await client.send_remote_command("menu")
                 assert await _until(lambda: not client.state.connected, timeout=1.5)
                 assert "no response" in (client.health.last_disconnect_reason or "")
+            finally:
+                await client.disconnect()
+
+    @pytest.mark.anyio
+    async def test_one_missed_reply_is_not_a_dead_link(self):
+        async with adapter("echo") as fake:
+            client = _client(fake.port)
+            try:
+                assert await client.connect()
+                fake.mode = "drop_next"  # the unit misses one reply, then answers the probe
+                await client.send_remote_command("menu")
+                await asyncio.sleep(1.0)
+                assert client.state.connected
+                assert "ZQS00" in fake.sent_text()[-40:]
             finally:
                 await client.disconnect()
 

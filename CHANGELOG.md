@@ -4,6 +4,15 @@ Builds are numbered `YYYY.MM.DD.BUILD`. Everything before the first entry is the
 [jaysoffian/ha-lumagen](https://github.com/jaysoffian/ha-lumagen) history, preserved in this
 repository's git log (up to upstream commit `4f32791`, 2026-03-27).
 
+## v2026.11.22.3
+
+- **The connection no longer drops on one late reply.** After a command, a reply that doesn't come within the
+  watchdog time (2 s) now gets a second chance: the integration asks the unit once more (`ZQS00`) and waits the
+  same time again before it disconnects. A Radiance Pro busy booting or switching inputs can miss one reply;
+  that dropped the connection for a few seconds, made every entity unavailable and could make an automation
+  that switched it at that moment fail.
+- **No watchdog for 90 s after a power command** (was 30 s): the unit can take over a minute to come up.
+
 ## v2026.10.30.2
 
 - New **Save Config** button (`button.<lumagen>_save_config`, configuration category): saves the Lumagen's current settings to flash (`ZY6SAVECONFIG`), so changes made from Home Assistant — CMS, Style, labels — survive a power cycle. Used by the Lumagen Card's *Save settings*.

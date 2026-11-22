@@ -1,6 +1,6 @@
 [project]
 name = "ha-lumagen"
-version = "2026.10.30.2"
+version = "2026.11.22.3"
 requires-python = ">=3.13"
 
 [dependency-groups]
